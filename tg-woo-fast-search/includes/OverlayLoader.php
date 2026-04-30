@@ -41,7 +41,26 @@ class OverlayLoader {
 
     private function getOverlayConfig() {
         $options = $this->settings->getOptions();
-        
+
+        // Excluded IDs are stored as a comma-separated string; demoted IDs as an array.
+        // Normalize both to arrays of positive ints for the front-end.
+        $excludedIds = [];
+        if (!empty($options['excluded_product_ids']) && is_string($options['excluded_product_ids'])) {
+            foreach (explode(',', $options['excluded_product_ids']) as $piece) {
+                $id = (int) trim($piece);
+                if ($id > 0) { $excludedIds[] = $id; }
+            }
+            $excludedIds = array_values(array_unique($excludedIds));
+        }
+        $demotedIds = [];
+        if (!empty($options['demoted_ids']) && is_array($options['demoted_ids'])) {
+            foreach ($options['demoted_ids'] as $id) {
+                $id = (int) $id;
+                if ($id > 0) { $demotedIds[] = $id; }
+            }
+            $demotedIds = array_values(array_unique($demotedIds));
+        }
+
         return [
             'enabled' => $options['enabled'],
             'mode' => $options['mode'],
@@ -51,6 +70,8 @@ class OverlayLoader {
             'searchKey' => $options['search_key'],
             'apiKey' => $options['api_key'],
             'hideOutOfStock' => $options['hide_out_of_stock'],
+            'excludedProductIds' => $excludedIds,
+            'demotedProductIds' => $demotedIds,
             'clientShardsEnabled' => $options['client_shards_enabled'],
             'clientShardsMaxSize' => $options['client_shards_max_size'] * 1024 * 1024, // Convert to bytes
             'clientShardsChunkSize' => $options['client_shards_chunk_size'] * 1024, // Convert to bytes

@@ -1,0 +1,64 @@
+/* FAST Search admin — light section/card styling for the settings page.
+   Scoped to .wk-settings-wrap so we never bleed into other admin pages. */
+
+.wk-settings-wrap .wk-card {
+    background: #fff;
+    border: 1px solid #c3c4c7;
+    border-radius: 6px;
+    padding: 4px 24px 12px;
+    margin: 0 0 20px;
+    box-shadow: 0 1px 1px rgba(0, 0, 0, 0.04);
+}
+
+.wk-settings-wrap .wk-card > h2 {
+    font-size: 15px;
+    font-weight: 600;
+    margin: 16px 0 4px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid #f0f0f1;
+    color: #1d2327;
+}
+
+.wk-settings-wrap .wk-card > .wk-card-desc {
+    margin: 0 0 8px;
+    color: #50575e;
+    font-size: 13px;
+}
+
+.wk-settings-wrap .wk-card .form-table {
+    margin-top: 0;
+}
+
+.wk-settings-wrap .wk-card .form-table th {
+    padding: 16px 10px 16px 0;
+    width: 220px;
+}
+
+.wk-settings-wrap h1 {
+    margin-bottom: 16px;
+}
+
+.wk-settings-wrap hr {
+    margin: 24px 0;
+    border: 0;
+    border-top: 1px solid #dcdcde;
+}
+
+/* Product picker sizing — Select2 renders adjacent to the hidden <select>. */
+.wk-settings-wrap .wk-product-picker + .select2-container,
+.wk-settings-wrap .select2-container.wk-product-picker-container {
+    width: 100% !important;
+    max-width: 600px;
+}
+
+.wk-settings-wrap .select2-selection--multiple {
+    min-height: 36px;
+    border-color: #8c8f94;
+    border-radius: 4px;
+}
+
+.wk-settings-wrap .select2-selection__choice {
+    background: #f0f6fc !important;
+    border: 1px solid #c5d9ed !important;
+    color: #1d2327 !important;
+}

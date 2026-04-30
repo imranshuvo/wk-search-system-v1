@@ -38,19 +38,39 @@ class WK_Fast_Search_Delta_Sync {
     }
     
     /**
+     * Whether each enabled variation is indexed as its own row.
+     * Toggle lives in WP options; cached per-request to avoid repeated reads inside hot hooks.
+     */
+    private static function index_variations_enabled() {
+        static $cached = null;
+        if ($cached !== null) { return $cached; }
+        if (function_exists('wk_fast_search_get_all_settings')) {
+            $settings = wk_fast_search_get_all_settings();
+            $cached = (($settings['index_variations'] ?? '1') === '1');
+        } else {
+            $cached = true; // safe default — match the toggle's default-on
+        }
+        return $cached;
+    }
+
+    /**
      * Initialize hooks
      */
     public static function init() {
         error_log("WK DELTA: Initializing DeltaSync hooks");
         self::log("🚀 INITIALIZING DELTA SYNC HOOKS");
-        
+
         // Product saved (created or updated)
         add_action('woocommerce_update_product', [__CLASS__, 'on_product_saved'], 10, 1);
         add_action('woocommerce_new_product', [__CLASS__, 'on_product_saved'], 10, 1);
-        
+
+        // Variation saved (created or updated). Only meaningful when toggle is ON; the handler no-ops otherwise.
+        add_action('woocommerce_save_product_variation', [__CLASS__, 'on_variation_saved'], 10, 1);
+        add_action('woocommerce_update_product_variation', [__CLASS__, 'on_variation_saved'], 10, 1);
+
         error_log("WK DELTA: Registered woocommerce_update_product and woocommerce_new_product hooks");
         self::log("✅ Registered product save hooks");
-        
+
         // Stock quantity changed (orders, inventory adjustments, etc.)
         add_action('woocommerce_product_set_stock', [__CLASS__, 'on_stock_changed'], 10, 1);
         add_action('woocommerce_variation_set_stock', [__CLASS__, 'on_stock_changed'], 10, 1);
@@ -100,6 +120,31 @@ class WK_Fast_Search_Delta_Sync {
         
         // Only sync published products that should be searchable
         if ($product->get_status() === 'publish' && wk_fast_search_is_product_searchable($product)) {
+            // Variation indexing: a variable parent's identity (price band, attributes, image) cascades
+            // to all its variation rows in the index. Re-emit each visible variation; skip the parent itself.
+            // (When toggle is OFF, fall through to the normal parent-upsert below.)
+            if (self::index_variations_enabled() && $product->is_type('variable')) {
+                // Same rationale as the full-feed loop: use get_children() not get_visible_children() so WC's
+                // "Hide OOS from catalog" core option does not silently fight this plugin's hide_out_of_stock setting.
+                $queued_any = false;
+                foreach ($product->get_children() as $variation_id) {
+                    $variation = wc_get_product($variation_id);
+                    if (!$variation || !$variation->variation_is_active()) {
+                        // Variation is disabled — make sure any prior row in the index is removed.
+                        self::queue_product_sync($variation_id, 'delete');
+                        continue;
+                    }
+                    self::queue_product_sync($variation_id, 'upsert');
+                    $queued_any = true;
+                }
+                if ($queued_any) {
+                    self::log("Variable parent {$product_id} saved — cascading upsert to enabled variations");
+                    // Make sure the parent isn't lingering in the index from a pre-toggle era.
+                    self::queue_product_sync($product_id, 'delete');
+                    return;
+                }
+                // No enabled variations — fall through and emit the parent so we don't lose the product.
+            }
             error_log("WK DELTA: Status is publish and searchable, queuing upsert");
             self::log("Product {$product_id} ({$product->get_name()}) saved with status 'publish' and is searchable - queuing upsert");
             self::queue_product_sync($product_id, 'upsert');
@@ -108,10 +153,45 @@ class WK_Fast_Search_Delta_Sync {
             error_log("WK DELTA: Status is not publish or not searchable, queuing delete");
             $reason = $product->get_status() !== 'publish' ? "status '{$product->get_status()}'" : "not searchable (exclude-from-search)";
             self::log("Product {$product_id} ({$product->get_name()}) - {$reason} - queuing delete");
-            // If not published or not searchable, remove from search
+            // If not published or not searchable, remove from search.
+            // Also drop any variation rows that may have been individually indexed.
             self::queue_product_sync($product_id, 'delete');
+            if (self::index_variations_enabled() && $product->is_type('variable')) {
+                foreach ($product->get_children() as $variation_id) {
+                    self::queue_product_sync($variation_id, 'delete');
+                }
+            }
         }
         error_log("WK DELTA: on_product_saved complete");
+    }
+
+    /**
+     * Variation saved (created or updated).
+     * Only relevant when index_variations is ON — otherwise the parent's existing flow already covers it.
+     */
+    public static function on_variation_saved($variation_id) {
+        if (!self::index_variations_enabled()) {
+            self::log("Skipping on_variation_saved for {$variation_id} — variation indexing is OFF");
+            return;
+        }
+        $variation = wc_get_product($variation_id);
+        if (!$variation || !$variation->is_type('variation')) {
+            return;
+        }
+        $parent = wc_get_product($variation->get_parent_id());
+        if (!$parent || $parent->get_status() !== 'publish' || !wk_fast_search_is_product_searchable($parent)) {
+            // Parent is gone, unpublished, or hidden — drop this variation from the index.
+            self::log("Variation {$variation_id}: parent {$variation->get_parent_id()} not eligible — queuing delete");
+            self::queue_product_sync($variation_id, 'delete');
+            return;
+        }
+        if (!$variation->variation_is_active()) {
+            self::log("Variation {$variation_id} is disabled — queuing delete");
+            self::queue_product_sync($variation_id, 'delete');
+            return;
+        }
+        self::log("Variation {$variation_id} saved — queuing upsert");
+        self::queue_product_sync($variation_id, 'upsert');
     }
     
     /**
@@ -130,19 +210,37 @@ class WK_Fast_Search_Delta_Sync {
             return;
         }
         
-        // If this is a variation, sync the parent product instead
+        // Variation routing: if the variation is its own row in the index, sync IT.
+        // Otherwise (toggle OFF), bump the parent so its min-price band stays accurate.
         if ($product_obj->is_type('variation')) {
+            if (self::index_variations_enabled()) {
+                self::log("Variation {$product_id} stock changed — syncing the variation directly (variation indexing is ON)");
+                // Keep $product_id / $product_obj as the variation; checks below use the parent's eligibility.
+                $parent_for_check = wc_get_product($product_obj->get_parent_id());
+                if (!$parent_for_check) {
+                    self::log("Parent for variation {$product_id} not found", 'WARNING');
+                    return;
+                }
+                if ($parent_for_check->get_status() === 'publish' && wk_fast_search_is_product_searchable($parent_for_check) && $product_obj->variation_is_active()) {
+                    self::log("Queuing upsert for variation {$product_id}");
+                    self::queue_product_sync($product_id, 'upsert');
+                } else {
+                    self::log("Variation {$product_id} not eligible (parent unpublished/hidden or variation disabled) — queuing delete");
+                    self::queue_product_sync($product_id, 'delete');
+                }
+                return;
+            }
             $parent_id = $product_obj->get_parent_id();
             self::log("Product {$product_id} is a variation, syncing parent {$parent_id} instead");
             $product_id = $parent_id;
             $product_obj = wc_get_product($parent_id);
-            
+
             if (!$product_obj) {
                 self::log("Parent product {$parent_id} not found", 'WARNING');
                 return;
             }
         }
-        
+
         // Only sync if product is published AND searchable
         if ($product_obj->get_status() === 'publish' && wk_fast_search_is_product_searchable($product_obj)) {
             self::log("Queuing upsert for product {$product_id}");
@@ -152,27 +250,43 @@ class WK_Fast_Search_Delta_Sync {
             self::log("Product {$product_id} is {$reason}, skipping sync");
         }
     }
-    
+
     /**
      * Stock status changed (in stock, out of stock, on backorder)
      */
     public static function on_stock_status_changed($product_id, $stock_status) {
         self::log("Stock status changed to '{$stock_status}' for product {$product_id}");
-        
+
         $product = wc_get_product($product_id);
-        
+
         if (!$product) {
             self::log("Product {$product_id} not found after stock status change", 'WARNING');
             return;
         }
-        
-        // If this is a variation, sync the parent product instead
+
+        // Same variation routing as on_stock_changed: sync the variation directly when toggle is ON.
         if ($product->is_type('variation')) {
+            if (self::index_variations_enabled()) {
+                self::log("Variation {$product_id} stock-status changed — syncing the variation directly");
+                $parent_for_check = wc_get_product($product->get_parent_id());
+                if (!$parent_for_check) {
+                    self::log("Parent for variation {$product_id} not found", 'WARNING');
+                    return;
+                }
+                if ($parent_for_check->get_status() === 'publish' && wk_fast_search_is_product_searchable($parent_for_check) && $product->variation_is_active()) {
+                    self::log("Queuing upsert for variation {$product_id}");
+                    self::queue_product_sync($product_id, 'upsert');
+                } else {
+                    self::log("Variation {$product_id} not eligible — queuing delete");
+                    self::queue_product_sync($product_id, 'delete');
+                }
+                return;
+            }
             $parent_id = $product->get_parent_id();
             self::log("Product {$product_id} is a variation, syncing parent {$parent_id} instead");
             $product_id = $parent_id;
             $product = wc_get_product($parent_id);
-            
+
             if (!$product) {
                 self::log("Parent product {$parent_id} not found", 'WARNING');
                 return;
@@ -225,6 +339,12 @@ class WK_Fast_Search_Delta_Sync {
      * Queue a product for sync (async)
      */
     private static function queue_product_sync($product_id, $action) {
+        // Host-gate: only the production hostnames may push to the search API.
+        // On staging/dev/local, drop silently — never queue, never push.
+        if (function_exists('wk_fast_search_sync_allowed') && !wk_fast_search_sync_allowed()) {
+            self::log("Skipping queue for product {$product_id} ({$action}) — sync disabled on this host");
+            return;
+        }
         // Get current queue
         $queue = get_option('wkfs_delta_sync_queue', []);
         
@@ -256,8 +376,14 @@ class WK_Fast_Search_Delta_Sync {
      * Process queued syncs (runs async)
      */
     public static function process_sync_queue() {
+        // Host-gate (defence-in-depth): a fresh staging clone may inherit a non-empty queue from production.
+        // Without this check, scheduled wkfs_delta_sync_process events on staging would still try to push.
+        if (function_exists('wk_fast_search_sync_allowed') && !wk_fast_search_sync_allowed()) {
+            self::log("Skipping queue processing — sync disabled on this host");
+            return;
+        }
         self::log("=== Starting delta sync queue processing ===");
-        
+
         $queue = get_option('wkfs_delta_sync_queue', []);
         
         if (empty($queue)) {
@@ -492,8 +618,12 @@ class WK_Fast_Search_Delta_Sync {
      * Retry failed syncs
      */
     public static function retry_failed_syncs() {
+        // Host-gate: same reasoning as process_sync_queue — wkfs_delta_sync_failed may also clone in.
+        if (function_exists('wk_fast_search_sync_allowed') && !wk_fast_search_sync_allowed()) {
+            return;
+        }
         $failed = get_option('wkfs_delta_sync_failed', []);
-        
+
         if (empty($failed)) return;
         
         self::log("=== Retrying " . count($failed) . " failed syncs ===");

@@ -96,28 +96,44 @@ class WKSearchOverlay {
             }
 
             input.dataset.wkSearchInitialized = 'true';
-            
+
+            // Trigger inputs are click-to-open targets only — never edited directly.
+            // readOnly prevents text entry while still allowing focus + click events to fire,
+            // and it sidesteps caret/IME state machines that some browsers got wedged on
+            // (the cause of the "first click doesn't open" symptom on Safari/Firefox).
+            if (input.tagName === 'INPUT') {
+                input.readOnly = true;
+                input.setAttribute('aria-haspopup', 'dialog');
+                input.style.cursor = 'pointer';
+            }
+
             // Add search icon click handler
-            const searchIcon = input.parentNode.querySelector('.search-submit, .search-icon, .search-button');
+            const searchIcon = input.parentNode && input.parentNode.querySelector
+                ? input.parentNode.querySelector('.search-submit, .search-icon, .search-button')
+                : null;
             if (searchIcon) {
                 searchIcon.addEventListener('click', (e) => {
                     e.preventDefault();
                     this.openOverlay();
                 });
-                
+
                 // Store reference to search icon for show/hide functionality
                 this.originalSearchIcon = searchIcon;
             }
-            
-            // Add input click handler
+
+            // mousedown fires earlier than click and is the most reliable open trigger;
+            // click and focus stay as fallbacks for keyboard users (Tab + Enter, screen readers).
+            input.addEventListener('mousedown', (e) => {
+                e.preventDefault();
+                this.openOverlay();
+            });
             input.addEventListener('click', (e) => {
                 e.preventDefault();
                 this.openOverlay();
             });
-            
-            // Add focus handler
-            input.addEventListener('focus', (e) => {
-                e.preventDefault();
+            input.addEventListener('focus', () => {
+                // Don't preventDefault on focus — there is no default action and some browsers
+                // treat the call as a hint to revoke focus. Just open the overlay.
                 this.openOverlay();
             });
         });
@@ -858,9 +874,25 @@ class WKSearchOverlay {
 
     focusSearchInput() {
         const searchInput = document.getElementById('wk-search-input');
-        if (searchInput) {
-            searchInput.focus();
-        }
+        if (!searchInput) { return; }
+        // Defer past the next paint: showOverlay() may be in the middle of a CSS transition,
+        // and Safari/Firefox silently drop focus() requests on elements that aren't fully
+        // visible yet. Two rAFs guarantee the element has been laid out and painted before
+        // we try to focus it — this is what makes the cursor blink reliably across browsers.
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+                try {
+                    searchInput.focus({ preventScroll: true });
+                    // Ensure the caret is positioned (some Safari builds focus without a caret).
+                    const len = searchInput.value ? searchInput.value.length : 0;
+                    if (typeof searchInput.setSelectionRange === 'function') {
+                        searchInput.setSelectionRange(len, len);
+                    }
+                } catch (e) {
+                    searchInput.focus();
+                }
+            });
+        });
     }
 
     handleSearchInput(e) {
@@ -1211,16 +1243,40 @@ class WKSearchOverlay {
         // Filter out excluded products if configured
         if (this.config.excludedProductIds && this.config.excludedProductIds.length > 0) {
             if (results.products && results.products.results) {
-                results.products.results = results.products.results.filter(p => 
-                    !this.config.excludedProductIds.includes(parseInt(p.id))
-                );
+                const excludedSet = new Set(this.config.excludedProductIds.map(Number));
+                results.products.results = results.products.results.filter(p => !excludedSet.has(parseInt(p.id)));
                 // Update total count
                 if (results.products.total) {
                     results.products.total = results.products.results.length;
                 }
             }
         }
-        
+
+        // Service products: hide on the empty-state/popular surface, demote (push to bottom) inside actual searches.
+        // The product remains findable when the user types its name — it just stops crowding default views and
+        // gets out of the way when the customer is searching for something else.
+        if (this.config.demotedProductIds && this.config.demotedProductIds.length > 0
+            && results.products && Array.isArray(results.products.results)) {
+            const demotedSet = new Set(this.config.demotedProductIds.map(Number));
+            const hasQuery = !!(this.currentQuery && this.currentQuery.trim().length > 0);
+            if (!hasQuery) {
+                // Empty-state / popular view → hide entirely.
+                results.products.results = results.products.results.filter(p => !demotedSet.has(parseInt(p.id)));
+                if (results.products.total) {
+                    results.products.total = results.products.results.length;
+                }
+            } else {
+                // Active search → push demoted products to the bottom, preserving original order within each group.
+                const normal = [];
+                const demoted = [];
+                for (const p of results.products.results) {
+                    if (demotedSet.has(parseInt(p.id))) { demoted.push(p); } else { normal.push(p); }
+                }
+                results.products.results = normal.concat(demoted);
+                // Total count stays the same — we re-ordered, not removed.
+            }
+        }
+
         // Show "Did you mean" if fallback was used OR if no results
         if (results.fallback_used || !results.products || results.products.results.length === 0) {
             this.showNoResults(results.fallback_used, this.currentQuery);

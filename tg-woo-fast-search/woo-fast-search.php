@@ -3,7 +3,7 @@
  * Plugin Name: Woo Fast Search
  * Plugin URI: https://webkonsulenterne.dk
  * Description: Advanced search system with intelligent suggestions, filters, and analytics for WooCommerce stores
- * Version: 2.0.0
+ * Version: 2.0.5
  * Author: Imran Khan
  * License: GPL v2 or later
  * Text Domain: woo-fast-search
@@ -28,13 +28,31 @@ add_action('before_woocommerce_init', function() {
 });
 
 // Define plugin constants
-define('WK_SEARCH_SYSTEM_VERSION', '2.0.0');
+define('WK_SEARCH_SYSTEM_VERSION', '2.0.5');
 define('WK_SEARCH_SYSTEM_PLUGIN_FILE', __FILE__);
 define('WK_SEARCH_SYSTEM_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('WK_SEARCH_SYSTEM_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('WK_SEARCH_SYSTEM_PLUGIN_BASENAME', plugin_basename(__FILE__));
 
 // Minimal mode: no diagnostics to avoid any extra overhead
+
+/**
+ * Hard host-gate for sync.
+ *
+ * Single-client plugin: only the production hostnames may push to the search API
+ * (delta sync, full-feed file generation, popular/top-categories exports).
+ * Any other host — staging.qliving.com, dev.qliving.com, localhost, anything else —
+ * is read-only against the search API: search overlay still works, no writes happen.
+ *
+ * Override for ad-hoc testing: `define('WK_FAST_SEARCH_FORCE_SYNC', true);` in wp-config.php.
+ */
+function wk_fast_search_sync_allowed() {
+    if (defined('WK_FAST_SEARCH_FORCE_SYNC') && WK_FAST_SEARCH_FORCE_SYNC) {
+        return true;
+    }
+    $host = strtolower((string) wp_parse_url(home_url(), PHP_URL_HOST));
+    return $host === 'qliving.com' || $host === 'www.qliving.com';
+}
 
 // Include Delta Sync module
 require_once WK_SEARCH_SYSTEM_PLUGIN_DIR . 'includes/DeltaSync.php';
@@ -140,6 +158,17 @@ add_action('admin_init', function() {
     register_setting('wk_fast_search_settings', 'wk_fast_search_debug_mode'); // boolean - enable debug console logging
     register_setting('wk_fast_search_settings', 'wk_fast_search_debug_delta_sync'); // boolean - enable delta sync logging
     register_setting('wk_fast_search_settings', 'wk_fast_search_excluded_product_ids'); // comma-separated product IDs to exclude from search
+    register_setting('wk_fast_search_settings', 'wk_fast_search_index_variations'); // boolean - index each variation as its own searchable product
+    register_setting('wk_fast_search_settings', 'wk_fast_search_demoted_ids', [
+        'type' => 'array',
+        'default' => [],
+        'sanitize_callback' => function($value) {
+            if (!is_array($value)) { return []; }
+            $clean = array_map('intval', $value);
+            $clean = array_values(array_unique(array_filter($clean, function($id){ return $id > 0; })));
+            return $clean;
+        }
+    ]);
 
     // Cleanup: ensure any legacy scheduled events are cleared
     if (function_exists('wp_next_scheduled')) {
@@ -186,6 +215,29 @@ add_action('admin_menu', function() {
     // Remove separate submenu; button will be in settings page
 });
 
+// Enqueue Select2 (via WooCommerce's selectWoo) + admin.css on the FAST Search settings page only.
+add_action('admin_enqueue_scripts', function($hook) {
+    // Hook for top-level menu page is "toplevel_page_<slug>".
+    if ($hook !== 'toplevel_page_wk-fast-search') {
+        return;
+    }
+    // WooCommerce registers these in admin context. Enqueue both for safety; if Woo isn't active the page degrades gracefully.
+    if (wp_script_is('selectWoo', 'registered')) {
+        wp_enqueue_script('selectWoo');
+    } elseif (wp_script_is('select2', 'registered')) {
+        wp_enqueue_script('select2');
+    }
+    if (wp_style_is('select2', 'registered')) {
+        wp_enqueue_style('select2');
+    }
+    wp_enqueue_style(
+        'wk-fast-search-admin',
+        plugins_url('assets/css/admin.css', __FILE__),
+        [],
+        defined('WK_SEARCH_SYSTEM_VERSION') ? WK_SEARCH_SYSTEM_VERSION : '1.0'
+    );
+});
+
 function wk_fast_search_render_settings_page() {
     if (!current_user_can('manage_options')) { return; }
     $settings = wk_fast_search_get_all_settings();
@@ -230,9 +282,10 @@ function wk_fast_search_render_settings_page() {
             }
         }
     }
-    echo '<div class="wrap"><h1>FAST Search Settings</h1>';
+    echo '<div class="wrap wk-settings-wrap"><h1>FAST Search Settings</h1>';
     echo '<form method="post" action="options.php">';
     settings_fields('wk_fast_search_settings');
+    echo '<div class="wk-card"><h2>' . esc_html__('Connection', 'woo-fast-search') . '</h2>';
     echo '<table class="form-table" role="presentation">';
     echo '<tr><th scope="row"><label for="wk_fast_search_tenant_id">Tenant ID</label></th><td><input name="wk_fast_search_tenant_id" id="wk_fast_search_tenant_id" type="text" class="regular-text" value="' . esc_attr($tenant_id) . '" /></td></tr>';
     echo '<tr><th scope="row"><label for="wk_fast_search_api_key">API Key</label></th><td><input name="wk_fast_search_api_key" id="wk_fast_search_api_key" type="text" class="regular-text" value="' . esc_attr($api_key) . '" /></td></tr>';
@@ -242,6 +295,9 @@ function wk_fast_search_render_settings_page() {
     echo '<input name="wk_fast_search_edge_url" id="wk_fast_search_edge_url" type="url" class="regular-text code" value="' . esc_attr($edge_url) . '" placeholder="https://api.example.com" />';
     echo '<p class="description">Base URL of the hosted search API (e.g., https://search.example.com). Used for /api/serve/search and suggestions.</p>';
     echo '</td></tr>';
+    echo '</table></div>';
+    echo '<div class="wk-card"><h2>' . esc_html__('Indexing & Facets', 'woo-fast-search') . '</h2>';
+    echo '<table class="form-table" role="presentation">';
     // Brand taxonomy selector
     echo '<tr><th scope="row"><label for="wk_fast_search_brand_taxonomy">Brand taxonomy</label></th><td>';
     echo '<select name="wk_fast_search_brand_taxonomy" id="wk_fast_search_brand_taxonomy">';
@@ -277,6 +333,17 @@ function wk_fast_search_render_settings_page() {
     echo '<p class="description">Select which global attributes (pa_*) to include as facets. Leave empty to include all.</p>';
     echo '</td></tr>';
 
+    // Index variations as individual products
+    $index_variations = $settings['index_variations'] ?? '1';
+    echo '<tr><th scope="row"><label for="wk_fast_search_index_variations">' . esc_html__('Index variations as individual products', 'woo-fast-search') . '</label></th><td>';
+    echo '<label><input type="checkbox" name="wk_fast_search_index_variations" id="wk_fast_search_index_variations" value="1" ' . checked($index_variations, '1', false) . '> ';
+    echo esc_html__('Each enabled variation appears as its own search result; the parent variable product is hidden from the index', 'woo-fast-search') . '</label>';
+    echo '<p class="description">' . esc_html__('When ON, a "T-Shirt – Black, M" variation can be matched and ranked individually. When OFF, only the parent product is indexed (with a price range). After changing this, run the full sync to rebuild the index.', 'woo-fast-search') . '</p>';
+    echo '</td></tr>';
+
+    echo '</table></div>';
+    echo '<div class="wk-card"><h2>' . esc_html__('Display', 'woo-fast-search') . '</h2>';
+    echo '<table class="form-table" role="presentation">';
     // Renderer mode
     $render_mode = $settings['render_mode'];
     echo '<tr><th scope="row"><label for="wk_fast_search_render_mode">' . esc_html__('Product renderer', 'woo-fast-search') . '</label></th><td>';
@@ -326,9 +393,12 @@ function wk_fast_search_render_settings_page() {
     echo '<p class="description">Text color for the search overlay header (should contrast with primary color). Enter hex code (e.g., #ffffff) or use color picker.</p>';
     echo '</td></tr>';
     
+    echo '</table></div>';
+    echo '<div class="wk-card"><h2>' . esc_html__('Search Behavior', 'woo-fast-search') . '</h2>';
+    echo '<table class="form-table" role="presentation">';
     // Filter settings
     $enabled_filters = $settings['enabled_filters'];
-    
+
     echo '<tr><th scope="row">Enabled Filters</th><td>';
     echo '<fieldset>';
     echo '<legend class="screen-reader-text"><span>Enabled Filters</span></legend>';
@@ -388,6 +458,9 @@ function wk_fast_search_render_settings_page() {
     echo '<p class="description">When enabled, products with no stock will be hidden from search results. This setting can also be controlled via the API tenant settings.</p>';
     echo '</td></tr>';
     
+    echo '</table></div>';
+    echo '<div class="wk-card"><h2>' . esc_html__('Diagnostics', 'woo-fast-search') . '</h2>';
+    echo '<table class="form-table" role="presentation">';
     // Debug Mode
     $debug_mode = $settings['debug_mode'];
     echo '<tr><th scope="row"><label for="wk_fast_search_debug_mode">Debug Mode</label></th><td>';
@@ -412,6 +485,10 @@ function wk_fast_search_render_settings_page() {
     echo '<p class="description">When enabled, searches will also match keywords in product descriptions. <strong>Note:</strong> This may reduce search performance and cause less relevant results. Disabled by default.</p>';
     echo '</td></tr>';
     
+    echo '</table></div>';
+    echo '<div class="wk-card"><h2>' . esc_html__('Empty State', 'woo-fast-search') . '</h2>';
+    echo '<p class="wk-card-desc">' . esc_html__('What to show in the search overlay before the user types anything.', 'woo-fast-search') . '</p>';
+    echo '<table class="form-table" role="presentation">';
     // Show Popular Searches
     $show_popular = $settings['show_popular_searches'] ?? 'no';
     echo '<tr><th scope="row"><label for="wk_fast_search_show_popular_searches">Show Popular Searches</label></th><td>';
@@ -428,16 +505,86 @@ function wk_fast_search_render_settings_page() {
     echo '<p class="description">When enabled, users will see their own recent searches before they start typing. Disabled by default.</p>';
     echo '</td></tr>';
     
-    // Excluded Product IDs
+    echo '</table></div>';
+    echo '<div class="wk-card"><h2>' . esc_html__('Service Products', 'woo-fast-search') . '</h2>';
+    echo '<p class="wk-card-desc">' . esc_html__('Special-handling products such as shipping fees, mileage charges, or miscellaneous service items. They stay searchable by name but are kept out of the way on default surfaces.', 'woo-fast-search') . '</p>';
+    echo '<table class="form-table" role="presentation">';
+
+    // Excluded Product IDs (hidden everywhere)
     $excluded_ids = $settings['excluded_product_ids'] ?? '';
-    echo '<tr><th scope="row"><label for="wk_fast_search_excluded_product_ids">Excluded Product IDs</label></th><td>';
+    echo '<tr><th scope="row"><label for="wk_fast_search_excluded_product_ids">' . esc_html__('Excluded Product IDs', 'woo-fast-search') . '</label></th><td>';
     echo '<input type="text" name="wk_fast_search_excluded_product_ids" id="wk_fast_search_excluded_product_ids" class="regular-text" value="' . esc_attr($excluded_ids) . '" placeholder="444, 123, 789" />';
-    echo '<p class="description">Comma-separated list of product IDs to exclude from search results. These products will never appear in search.</p>';
+    echo '<p class="description">' . esc_html__('Comma-separated product IDs to hide from search results entirely. Use sparingly — these products will never appear in search.', 'woo-fast-search') . '</p>';
     echo '</td></tr>';
-    
-    echo '</table>';
+
+    // Push-to-bottom product IDs (push to bottom in search; hide on popular/empty-state)
+    $demoted_ids = isset($settings['demoted_ids']) && is_array($settings['demoted_ids']) ? array_map('intval', $settings['demoted_ids']) : [];
+    echo '<tr><th scope="row"><label for="wk_fast_search_demoted_ids">' . esc_html__('Push to bottom', 'woo-fast-search') . '</label></th><td>';
+    // Sentinel hidden input ensures the option saves as empty array when the picker is cleared
+    // (an empty multi-select posts no key at all, which would leave the old value unchanged).
+    echo '<input type="hidden" name="wk_fast_search_demoted_ids[]" value="" />';
+    echo '<select multiple class="wk-product-picker" name="wk_fast_search_demoted_ids[]" id="wk_fast_search_demoted_ids" data-placeholder="' . esc_attr__('Type a product name…', 'woo-fast-search') . '" style="width: 100%; max-width: 600px;">';
+    if (!empty($demoted_ids) && function_exists('wc_get_product')) {
+        foreach ($demoted_ids as $pid) {
+            $product = wc_get_product($pid);
+            if (!$product) { continue; }
+            $label = sprintf('%s (#%d)', $product->get_formatted_name(), $pid);
+            echo '<option value="' . esc_attr($pid) . '" selected>' . esc_html($label) . '</option>';
+        }
+    }
+    echo '</select>';
+    echo '<p class="description">' . esc_html__('Selected products will be pushed to the bottom of search results and hidden from the empty-state popular products list. They remain findable when the customer searches for them by name.', 'woo-fast-search') . '</p>';
+    echo '</td></tr>';
+
+    echo '</table></div>';
     submit_button('Save Changes');
     echo '</form>';
+
+    // Initialize Select2 product picker for demoted_ids using WooCommerce's built-in product search AJAX.
+    $wc_search_nonce = function_exists('wp_create_nonce') ? wp_create_nonce('search-products') : '';
+    echo '<script>
+    (function(){
+        function initPicker(){
+            if (typeof jQuery === "undefined") { return; }
+            var $sel = jQuery("#wk_fast_search_demoted_ids");
+            if (!$sel.length) { return; }
+            var s2 = (typeof jQuery.fn.selectWoo === "function") ? "selectWoo" : ((typeof jQuery.fn.select2 === "function") ? "select2" : null);
+            if (!s2) { return; }
+            $sel[s2]({
+                multiple: true,
+                placeholder: $sel.data("placeholder") || "",
+                allowClear: true,
+                minimumInputLength: 2,
+                ajax: {
+                    url: ' . wp_json_encode(admin_url('admin-ajax.php')) . ',
+                    dataType: "json",
+                    delay: 250,
+                    data: function(params){
+                        return {
+                            action: "woocommerce_json_search_products",
+                            security: ' . wp_json_encode($wc_search_nonce) . ',
+                            term: params.term,
+                            exclude_type: "variation"
+                        };
+                    },
+                    processResults: function(data){
+                        var items = [];
+                        jQuery.each(data, function(id, text){
+                            items.push({ id: id, text: text });
+                        });
+                        return { results: items };
+                    },
+                    cache: true
+                }
+            });
+        }
+        if (document.readyState === "loading") {
+            document.addEventListener("DOMContentLoaded", initPicker);
+        } else {
+            initPicker();
+        }
+    })();
+    </script>';
     
     // Add JavaScript to sync text inputs with color pickers
     echo '<script>
@@ -480,20 +627,31 @@ function wk_fast_search_render_settings_page() {
         echo '<div class="notice notice-success is-dismissible"><p>Generated products.json with ' . esc_html($count) . ' products.</p>';
         echo '<p><strong>Products JSON URL:</strong> <code>' . esc_html($products_url) . '</code></p></div>';
     }
-    echo '<hr />';
-    echo '<h2>Manual Feed Generation</h2>';
-    echo '<p>Click to generate products.json now. This runs on-demand and does not set up any background tasks.</p>';
+    if (!empty($_GET['wk_sync_blocked'])) {
+        $current_host = (string) wp_parse_url(home_url(), PHP_URL_HOST);
+        echo '<div class="notice notice-warning is-dismissible"><p><strong>Sync is disabled on this host (<code>' . esc_html($current_host) . '</code>).</strong> Only the production hostnames may push to the search API. Search overlay still works in read-only mode.</p></div>';
+    }
+    echo '<div class="wk-card"><h2>' . esc_html__('Manual Feed Generation', 'woo-fast-search') . '</h2>';
+    echo '<p class="wk-card-desc">' . esc_html__('Generate products.json on-demand. Does not set up any background task.', 'woo-fast-search') . '</p>';
     echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '">';
     echo '<input type="hidden" name="action" value="wk_fast_search_generate" />';
     echo '<input type="hidden" name="_wpnonce" value="' . esc_attr(wp_create_nonce('wk_fast_search_generate')) . '" />';
     submit_button('Generate products.json now', 'secondary');
-    echo '</form>';
+    echo '</form></div>';
 
+    // Command line documentation — same effect as the button above, useful for cron / scripted ops.
+    echo '<div class="wk-card"><h2>' . esc_html__('Command Line (WP-CLI)', 'woo-fast-search') . '</h2>';
+    echo '<p class="wk-card-desc">' . esc_html__('Trigger a full re-sync from the shell. Same effect as the "Generate products.json now" button — useful for cron jobs, scripted deploys, or remote terminals.', 'woo-fast-search') . '</p>';
+    echo '<table class="form-table" role="presentation">';
+    echo '<tr><th scope="row">' . esc_html__('Generate the feed', 'woo-fast-search') . '</th><td>';
+    echo '<p><code>wp wkfs feed:generate</code></p>';
+    echo '<p class="description">' . esc_html__('Subject to the host-gate: runs only on the production hostnames (qliving.com / www.qliving.com). On staging, dev, or any other host it exits with a warning. Add `define(\'WK_FAST_SEARCH_FORCE_SYNC\', true);` to wp-config.php only if you genuinely need to sync from a non-production host.', 'woo-fast-search') . '</p>';
+    echo '</td></tr>';
+    echo '</table></div>';
 
     // Manual sync popular queries (button under products.json section)
-    echo '<hr />';
-    echo '<h2>Popular Searches</h2>';
-    echo '<p>Export a popular_searches.json file alongside products.json. Configure the URL in Laravel (like products.json) and run sync from there.</p>';
+    echo '<div class="wk-card"><h2>' . esc_html__('Popular Searches', 'woo-fast-search') . '</h2>';
+    echo '<p class="wk-card-desc">' . esc_html__('Export a popular_searches.json file alongside products.json. Configure the URL in Laravel and run sync from there.', 'woo-fast-search') . '</p>';
     if (!empty($_GET['wk_popular_exported'])) {
         echo '<div class="notice notice-success is-dismissible"><p>popular_searches.json exported.</p></div>';
     }
@@ -506,10 +664,10 @@ function wk_fast_search_render_settings_page() {
     echo '<input type="hidden" name="action" value="wk_fast_search_export_popular" />';
     echo '<input type="hidden" name="_wpnonce" value="' . esc_attr(wp_create_nonce('wk_fast_search_export_popular')) . '" />';
     submit_button('Export popular_searches.json', 'secondary');
-    echo '</form>';
+    echo '</form></div>';
 
     // Top Categories export (by sales)
-    echo '<h2 style="margin-top:24px">Top Categories (by sales)</h2>';
+    echo '<div class="wk-card"><h2>' . esc_html__('Top Categories (by sales)', 'woo-fast-search') . '</h2>';
     if (!empty($_GET['wk_topcats_exported'])) {
         echo '<div class="notice notice-success is-dismissible"><p>top_categories.json exported.</p></div>';
     }
@@ -519,7 +677,7 @@ function wk_fast_search_render_settings_page() {
     echo '<input type="hidden" name="action" value="wk_fast_search_export_top_categories" />';
     echo '<input type="hidden" name="_wpnonce" value="' . esc_attr(wp_create_nonce('wk_fast_search_export_top_categories')) . '" />';
     submit_button('Export top_categories.json', 'secondary');
-    echo '</form>';
+    echo '</form></div>';
 
     echo '</div>';
 }
@@ -587,6 +745,8 @@ add_action('rest_api_init', function(){
 
 // Manual push popular searches to Laravel (URL-based ingest)
 add_action('wk_fast_search_push_popular', function(){
+    // Host-gate: only production may push to the search API.
+    if (!wk_fast_search_sync_allowed()) { return; }
     // Push aggregated queries to Laravel and reset counts upon success
     global $wpdb;
     wk_fs_ensure_popular_table_exists();
@@ -724,6 +884,8 @@ function wk_fast_search_get_all_settings() {
         'wk_fast_search_debug_delta_sync',
         'wk_fast_search_search_description',
         'wk_fast_search_excluded_product_ids',
+        'wk_fast_search_demoted_ids',
+        'wk_fast_search_index_variations',
         // String overrides
         'wk_fast_search_string_searchPlaceholder',
         'wk_fast_search_string_filters',
@@ -798,6 +960,8 @@ function wk_fast_search_get_all_settings() {
         'debug_delta_sync' => '0',
         'search_description' => '0',
         'excluded_product_ids' => '',
+        'demoted_ids' => array(),
+        'index_variations' => '1',
         'strings' => array(
             'searchPlaceholder' => __('Search products...', 'woo-fast-search'),
             'filters' => __('Filters', 'woo-fast-search'),
@@ -879,11 +1043,31 @@ function getStringWithFallback($option_name, $default_value) {
 // ====== REST: Product HTML rendering (no admin-ajax) ======
 // Removed REST renderer per decision to pre-render HTML into products.json for speed.
 
+// Minimal WP-CLI command: trigger a full feed regeneration.
+// Usage: wp wkfs feed:generate
+// Same host-gate applies — non-prod hosts return 0 silently.
+if (defined('WP_CLI') && WP_CLI) {
+    WP_CLI::add_command('wkfs feed:generate', function() {
+        if (!wk_fast_search_sync_allowed()) {
+            $host = (string) wp_parse_url(home_url(), PHP_URL_HOST);
+            WP_CLI::warning("Sync is disabled on this host ({$host}). Define WK_FAST_SEARCH_FORCE_SYNC for an override.");
+            return;
+        }
+        WP_CLI::log('Generating products.json…');
+        $count = wk_fast_search_generate_products_json();
+        WP_CLI::success("Wrote {$count} rows to products.json");
+    });
+}
+
 // Manual generation handler
 add_action('admin_post_wk_fast_search_generate', 'wk_fast_search_handle_manual_generate');
 function wk_fast_search_handle_manual_generate() {
     if (!current_user_can('manage_options')) { wp_die('Forbidden'); }
     check_admin_referer('wk_fast_search_generate');
+    if (!wk_fast_search_sync_allowed()) {
+        wp_safe_redirect(add_query_arg(['page'=>'wk-fast-search','wk_sync_blocked'=>1], admin_url('admin.php')));
+        exit;
+    }
     $count = wk_fast_search_generate_products_json();
     $redirect = add_query_arg([
         'page' => 'wk-fast-search',
@@ -898,6 +1082,10 @@ function wk_fast_search_handle_manual_generate() {
 add_action('admin_post_wk_fast_search_export_popular', function(){
     if (!current_user_can('manage_options')) { wp_die('Forbidden'); }
     check_admin_referer('wk_fast_search_export_popular');
+    if (!wk_fast_search_sync_allowed()) {
+        wp_safe_redirect(add_query_arg(['page'=>'wk-fast-search','wk_sync_blocked'=>1], admin_url('admin.php')));
+        exit;
+    }
     global $wpdb;
     wk_fs_ensure_popular_table_exists();
     $settings = wk_fast_search_get_all_settings();
@@ -922,6 +1110,10 @@ add_action('admin_post_wk_fast_search_export_popular', function(){
 add_action('admin_post_wk_fast_search_export_top_categories', function(){
     if (!current_user_can('manage_options')) { wp_die('Forbidden'); }
     check_admin_referer('wk_fast_search_export_top_categories');
+    if (!wk_fast_search_sync_allowed()) {
+        wp_safe_redirect(add_query_arg(['page'=>'wk-fast-search','wk_sync_blocked'=>1], admin_url('admin.php')));
+        exit;
+    }
     $settings = wk_fast_search_get_all_settings();
     $tenant = $settings['tenant_id'] ?: 'default';
     $tenant_slug = sanitize_title($tenant);
@@ -1044,7 +1236,116 @@ function wkfs_render_woo_product_card( $product_id ) {
     return $html;
 }}
 
+/**
+ * Build a single feed item — works for both top-level products and variations.
+ *
+ * For variations, $context_parent is the parent variable product (used for inherited
+ * fields like brand/categories/description; the variation provides its own price/sku/image/url/title).
+ * For top-level products, $context_parent is null.
+ *
+ * Returns null when the product/variation should be skipped (invalid price, etc.).
+ */
+function wk_fast_search_build_feed_item($product, $context_parent, $settings) {
+    // Determine which product object provides each field.
+    $is_variation = $context_parent !== null;
+    $brand_source = $is_variation ? $context_parent : $product;
+    $tax_source   = $is_variation ? $context_parent : $product; // variations inherit categories/tags from parent
+
+    // Price handling.
+    if (!$is_variation && $product->is_type('variable')) {
+        // Parent variable product (toggle OFF case): show min variation price as a range hint.
+        $price = wk_fast_search_sanitize_price($product->get_variation_price('min', false));
+        $price_old = wk_fast_search_sanitize_price($product->get_variation_regular_price('min', false));
+    } else {
+        $price = wk_fast_search_sanitize_price($product->get_price());
+        $price_old = wk_fast_search_sanitize_price($product->get_regular_price());
+    }
+    if ($price === null || $price_old === null) {
+        return null;
+    }
+
+    // Pre-rendered HTML: render top-level products as before.
+    // Variations skip the pre-render — RenderController handles them on-demand at search time
+    // (variation post + content-product.php template can produce theme-specific oddities; on-demand
+    // rendering keeps the feed clean and gives the storefront fresh HTML each request).
+    $rendered_html = '';
+    if (!$is_variation) {
+        $render_mode = $settings['render_mode'];
+        $loop_id = (int) $settings['elementor_loop_id'];
+        if ($render_mode === 'elementor' && $loop_id > 0 && class_exists('Elementor\\Plugin')) {
+            $rendered_html = wkfs_render_elementor_loop_item_for_product($product->get_id(), $loop_id);
+        } else {
+            $rendered_html = wkfs_render_woo_product_card($product->get_id());
+        }
+    }
+
+    // Image: variations may have their own image; fall back to parent.
+    if ($is_variation) {
+        $image_id = $product->get_image_id();
+        if (!$image_id) {
+            $image_id = $context_parent->get_image_id();
+        }
+        $image = $image_id ? wp_get_attachment_image_src($image_id, 'woocommerce_thumbnail') : null;
+        $image_url = $image ? $image[0] : '';
+    } else {
+        $image_url = wk_fast_search_get_image($product);
+    }
+
+    // SKU: variations sometimes have empty SKU; fall back to parent's.
+    $sku = (string) $product->get_sku();
+    if ($sku === '' && $is_variation) {
+        $sku = (string) $context_parent->get_sku();
+    }
+
+    $item = [
+        'id' => $product->get_id(),
+        'sku' => $sku,
+        // $product->get_name() on a WC_Product_Variation already returns
+        // "Parent Name – Attribute, Attribute" via Woo core.
+        'title' => $product->get_name(),
+        // Variations don't carry their own short_description; pull from parent.
+        'description' => wk_fast_search_get_description($brand_source),
+        'slug' => $is_variation ? $context_parent->get_slug() : $product->get_slug(),
+        // Variation permalink includes ?attribute_*=… so add-to-cart pre-selects the variant.
+        'url' => $is_variation ? $product->get_permalink() : get_permalink($product->get_id()),
+        'brand' => wk_fast_search_get_brand($brand_source),
+        'hierarchies' => wk_fast_search_get_hierarchies($tax_source),
+        'attributes' => wk_fast_search_get_attributes($tax_source),
+        'price' => $price,
+        'price_old' => $price_old,
+        'currency' => get_woocommerce_currency(),
+        // Per-variation stock — the existing hide_out_of_stock display filter then handles visibility.
+        'in_stock' => $product->is_in_stock(),
+        'rating' => $is_variation ? $context_parent->get_average_rating() : $product->get_average_rating(),
+        'image' => $image_url,
+        'html' => $rendered_html ? do_shortcode($rendered_html) : null,
+        // Popularity inherited from parent — variations don't accumulate sales/views in the parent's meta.
+        'popularity' => wk_fast_search_get_popularity($brand_source),
+        'purchase_count' => (int) get_post_meta(($is_variation ? $context_parent->get_id() : $product->get_id()), 'total_sales', true),
+        'created_at' => $product->get_date_created() ? $product->get_date_created()->format('c') : null,
+        'updated_at' => $product->get_date_modified() ? $product->get_date_modified()->format('c') : null,
+    ];
+
+    // Optionally augment attributes with selected taxonomy facets (from parent for variations).
+    $extra_tax_facets = $settings['taxonomy_facets'];
+    if (is_array($extra_tax_facets) && !empty($extra_tax_facets)) {
+        foreach ($extra_tax_facets as $tax) {
+            $terms = wp_get_post_terms($tax_source->get_id(), $tax);
+            if (is_array($terms) && !empty($terms)) {
+                $item['attributes'][$tax] = array_values(array_unique(array_map(function($t){ return is_object($t)? $t->name : (string)$t; }, $terms)));
+            }
+        }
+    }
+
+    return $item;
+}
+
 function wk_fast_search_generate_products_json() {
+    // Host-gate: silently skip on non-production hosts (e.g. staging.qliving.com, dev.qliving.com).
+    // Prevents the hourly wk_fast_search_products_json cron from regenerating the feed on staging clones.
+    if (!wk_fast_search_sync_allowed()) {
+        return 0;
+    }
     $settings = wk_fast_search_get_all_settings();
     $tenant = $settings['tenant_id'] ?: 'default';
     if (empty($tenant)) { $tenant = 'default'; }
@@ -1072,82 +1373,54 @@ function wk_fast_search_generate_products_json() {
         ]);
         $product_ids = $query->posts;
         if (empty($product_ids)) { break; }
+        $settings = wk_fast_search_get_all_settings();
+        $index_variations = ($settings['index_variations'] ?? '1') === '1';
+
         foreach ($product_ids as $product_id) {
             $product = wc_get_product($product_id);
             if (!$product) { continue; }
-            
-            // Check if product should be searchable (exclude catalog-only and hidden products)
+
+            // Check if product should be searchable (excludes catalog-only and hidden products via WC visibility).
+            // Variations inherit visibility from the parent, so this single check covers them too.
             if (!wk_fast_search_is_product_searchable($product)) {
                 continue;
             }
-            
-            // Handle variable products specially - use WooCommerce built-in functions
-            if ($product->is_type('variable')) {
-                // Get minimum variation prices using WooCommerce built-in methods
-                $price = $product->get_variation_price('min', false); // false = unformatted price
-                $price_old = $product->get_variation_regular_price('min', false);
-                
-                // Sanitize the prices
-                $price = wk_fast_search_sanitize_price($price);
-                $price_old = wk_fast_search_sanitize_price($price_old);
-            } else {
-                // Regular products - use standard price handling
-                $price = wk_fast_search_sanitize_price($product->get_price());
-                $price_old = wk_fast_search_sanitize_price($product->get_regular_price());
-            }
-            
-            if ($price === null || $price_old === null) {
-                // Skip product with invalid prices
-                continue;
-            }
-            
-            // Pre-render product HTML based on settings
-            $settings = wk_fast_search_get_all_settings();
-            $render_mode = $settings['render_mode'];
-            $loop_id = (int) $settings['elementor_loop_id'];
-            $rendered_html = '';
-            if ($render_mode === 'elementor' && $loop_id > 0 && class_exists('Elementor\\Plugin')) {
-                $rendered_html = wkfs_render_elementor_loop_item_for_product($product->get_id(), $loop_id);
-            } else {
-                $rendered_html = wkfs_render_woo_product_card($product->get_id());
-            }
 
-            $item = [
-                'id' => $product->get_id(),
-                'sku' => $product->get_sku(),
-                'title' => $product->get_name(),
-                'description' => wk_fast_search_get_description($product),
-                'slug' => $product->get_slug(),
-                'url' => get_permalink($product->get_id()),
-                'brand' => wk_fast_search_get_brand($product),
-                'hierarchies' => wk_fast_search_get_hierarchies($product),
-                'attributes' => wk_fast_search_get_attributes($product),
-                'price' => $price,
-                'price_old' => $price_old,
-                'currency' => get_woocommerce_currency(),
-                'in_stock' => $product->is_in_stock(),
-                'rating' => $product->get_average_rating(),
-                'image' => wk_fast_search_get_image($product),
-                'html' => $rendered_html ? do_shortcode($rendered_html) : null,
-                'popularity' => wk_fast_search_get_popularity($product),
-                'purchase_count' => (int) get_post_meta($product->get_id(), 'total_sales', true),
-                'created_at' => $product->get_date_created() ? $product->get_date_created()->format('c') : null,
-                'updated_at' => $product->get_date_modified() ? $product->get_date_modified()->format('c') : null,
-            ];
-            // Optionally augment attributes with selected taxonomy facets
-            $extra_tax_facets = $settings['taxonomy_facets'];
-            if (is_array($extra_tax_facets) && !empty($extra_tax_facets)) {
-                foreach ($extra_tax_facets as $tax) {
-                    $terms = wp_get_post_terms($product->get_id(), $tax);
-                    if (is_array($terms) && !empty($terms)) {
-                        $item['attributes'][$tax] = array_values(array_unique(array_map(function($t){ return is_object($t)? $t->name : (string)$t; }, $terms)));
+            // Variations branch: expand variable parents into per-variation rows when the toggle is ON,
+            // otherwise emit the parent as before.
+            if ($index_variations && $product->is_type('variable')) {
+                // Use get_children() not get_visible_children(): the latter honors WC's core "Hide OOS from catalog"
+                // option which would silently double-filter against this plugin's own hide_out_of_stock setting.
+                // Parent products at the WP_Query above are also pulled regardless of stock — keep variations consistent.
+                // We then filter explicitly: only enabled variations are emitted.
+                $children = $product->get_children();
+                $emitted_any_variation = false;
+                foreach ($children as $variation_id) {
+                    $variation = wc_get_product($variation_id);
+                    if (!$variation || !$variation->variation_is_active()) { continue; }
+                    $item = wk_fast_search_build_feed_item($variation, $product, $settings);
+                    if ($item === null) { continue; }
+                    if (!$first) { fwrite($fh, ','); }
+                    fwrite($fh, wp_json_encode($item));
+                    $first = false; $total++;
+                    $emitted_any_variation = true;
+                }
+                if (!$emitted_any_variation) {
+                    // No enabled variations made it through — fall back to emitting the parent so we don't lose the product.
+                    $item = wk_fast_search_build_feed_item($product, null, $settings);
+                    if ($item !== null) {
+                        if (!$first) { fwrite($fh, ','); }
+                        fwrite($fh, wp_json_encode($item));
+                        $first = false; $total++;
                     }
                 }
+            } else {
+                $item = wk_fast_search_build_feed_item($product, null, $settings);
+                if ($item === null) { continue; }
+                if (!$first) { fwrite($fh, ','); }
+                fwrite($fh, wp_json_encode($item));
+                $first = false; $total++;
             }
-            $json = wp_json_encode($item);
-            if (!$first) { fwrite($fh, ','); }
-            fwrite($fh, $json);
-            $first = false; $total++;
         }
         if (function_exists('gc_collect_cycles')) { gc_collect_cycles(); }
         $page++;
@@ -1430,7 +1703,7 @@ add_action('wp_enqueue_scripts', function(){
         'wkfs-search-overlay',
         plugins_url('assets/js/search-overlay.js', __FILE__),
         [],
-        '2.0.0',
+        WK_SEARCH_SYSTEM_VERSION,
         true
     );
     
@@ -1468,7 +1741,8 @@ add_action('wp_enqueue_scripts', function(){
         'showPopularSearches' => isset($settings['show_popular_searches']) && $settings['show_popular_searches'] === 'yes',
         'showRecentSearches' => isset($settings['show_recent_searches']) && $settings['show_recent_searches'] === 'yes',
         'themeName' => sanitize_title(wp_get_theme()->get('Name')),
-        'excludedProductIds' => array_filter(array_map('intval', explode(',', $settings['excluded_product_ids'] ?? ''))),
+        'excludedProductIds' => array_values(array_filter(array_map('intval', explode(',', $settings['excluded_product_ids'] ?? '')), function($id){ return $id > 0; })),
+        'demotedProductIds' => array_values(array_filter(array_map('intval', is_array($settings['demoted_ids'] ?? null) ? $settings['demoted_ids'] : []), function($id){ return $id > 0; })),
         'strings' => $settings['strings']
     ]);
 });
@@ -1788,15 +2062,20 @@ function wk_fast_search_track_search() {
     if (!defined('DOING_AJAX') || !DOING_AJAX) {
         wp_send_json_error('invalid');
     }
-    
+
+    // Host-gate: tracking events forwarded to the search API count as writes; block on non-prod.
+    if (!wk_fast_search_sync_allowed()) {
+        wp_send_json_success(['skipped' => 'sync_disabled_on_host']);
+    }
+
     // Get tracking data
     $event_type = sanitize_text_field($_POST['event_type'] ?? '');
     $event_data = $_POST['event_data'] ?? [];
-    
+
     if (empty($event_type)) {
         wp_send_json_error('missing_event_type');
     }
-    
+
     // Forward to search API
     $settings = wk_fast_search_get_all_settings();
     $tenant = $settings['tenant_id'];
