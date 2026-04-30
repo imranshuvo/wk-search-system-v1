@@ -1,0 +1,47 @@
+# OS
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Editors / IDEs
+.idea/
+.vscode/
+.fleet/
+.nova/
+.zed/
+.phpactor.json
+*.swp
+*.swo
+*~
+
+# Claude / agent state
+.claude/
+.claude.local/
+
+# Logs
+*.log
+logs/
+
+# Env files (defence-in-depth; search-api/ also ignores its own)
+.env
+.env.local
+.env.*.local
+.env.backup
+.env.bak
+.env.production
+
+# Dependencies / build output (anywhere in the tree)
+node_modules/
+vendor/
+dist/
+build/
+
+# PHP tooling
+.phpunit.result.cache
+.phpunit.cache/
+
+# Misc
+*.bak
+*.tmp
+*.orig
