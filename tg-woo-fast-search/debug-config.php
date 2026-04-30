@@ -115,7 +115,7 @@ header('Content-Type: text/html; charset=utf-8');
     <div class="section">
         <h2>Action Items</h2>
         <ol>
-            <li>If settings show "NOT SET", go to WordPress Admin → FAST Search → General and save your settings</li>
+            <li>If settings show "NOT SET", go to WordPress Admin → Searchly → General and save your settings</li>
             <li>Clear browser cache (Ctrl+Shift+R or Cmd+Shift+R)</li>
             <li>Clear WordPress object cache if using any caching plugin</li>
             <li>Check browser console for JavaScript errors</li>

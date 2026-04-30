@@ -1,9 +1,9 @@
 <?php
 /**
- * Plugin Name: Woo Fast Search
+ * Plugin Name: Searchly
  * Plugin URI: https://webkonsulenterne.dk
  * Description: Advanced search system with intelligent suggestions, filters, and analytics for WooCommerce stores
- * Version: 2.0.5
+ * Version: 2.0.6
  * Author: Imran Khan
  * License: GPL v2 or later
  * Text Domain: woo-fast-search
@@ -28,7 +28,7 @@ add_action('before_woocommerce_init', function() {
 });
 
 // Define plugin constants
-define('WK_SEARCH_SYSTEM_VERSION', '2.0.5');
+define('WK_SEARCH_SYSTEM_VERSION', '2.0.6');
 define('WK_SEARCH_SYSTEM_PLUGIN_FILE', __FILE__);
 define('WK_SEARCH_SYSTEM_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('WK_SEARCH_SYSTEM_PLUGIN_URL', plugin_dir_url(__FILE__));
@@ -183,8 +183,8 @@ add_action('admin_init', function() {
 add_action('admin_menu', function() {
     // Main menu
     add_menu_page(
-        __('FAST Search', 'woo-fast-search'),
-        __('FAST Search', 'woo-fast-search'),
+        __('Searchly', 'woo-fast-search'),
+        __('Searchly', 'woo-fast-search'),
         'manage_options',
         'wk-fast-search',
         'wk_fast_search_render_settings_page',
@@ -215,7 +215,7 @@ add_action('admin_menu', function() {
     // Remove separate submenu; button will be in settings page
 });
 
-// Enqueue Select2 (via WooCommerce's selectWoo) + admin.css on the FAST Search settings page only.
+// Enqueue Select2 (via WooCommerce's selectWoo) + admin.css on the Searchly settings page only.
 add_action('admin_enqueue_scripts', function($hook) {
     // Hook for top-level menu page is "toplevel_page_<slug>".
     if ($hook !== 'toplevel_page_wk-fast-search') {
@@ -282,7 +282,7 @@ function wk_fast_search_render_settings_page() {
             }
         }
     }
-    echo '<div class="wrap wk-settings-wrap"><h1>FAST Search Settings</h1>';
+    echo '<div class="wrap wk-settings-wrap"><h1>' . esc_html__('Searchly Settings', 'woo-fast-search') . '</h1>';
     echo '<form method="post" action="options.php">';
     settings_fields('wk_fast_search_settings');
     echo '<div class="wk-card"><h2>' . esc_html__('Connection', 'woo-fast-search') . '</h2>';
@@ -370,7 +370,7 @@ function wk_fast_search_render_settings_page() {
     // Custom search form selectors (comma-separated)
     echo '<tr><th scope="row"><label for="wk_fast_search_selectors">Search form selectors</label></th><td>';
     echo '<input name="wk_fast_search_selectors" id="wk_fast_search_selectors" type="text" class="regular-text code" value="' . esc_attr($custom_selectors) . '" placeholder="#search, .header-search input[name=\'s\']" />';
-    echo '<p class="description">Comma-separated CSS selectors. Clicking or focusing these will open the FAST Search overlay.</p>';
+    echo '<p class="description">Comma-separated CSS selectors. Clicking or focusing these will open the Searchly overlay.</p>';
     echo '</td></tr>';
     
     // Color settings
@@ -828,7 +828,7 @@ function wk_fast_search_render_strings_page() {
     
     echo '<div class="wrap">';
 
-    echo '<h1>' . esc_html__('FAST Search – Text Customization', 'woo-fast-search') . '</h1>';
+    echo '<h1>' . esc_html__('Searchly – Text Customization', 'woo-fast-search') . '</h1>';
     echo '<p>' . esc_html__('Customize all text strings used in the search overlay. Leave fields empty to use default translations.', 'woo-fast-search') . '</p>';
     echo '<form method="post" action="options.php">';
     settings_fields('wk_fast_search_strings');
