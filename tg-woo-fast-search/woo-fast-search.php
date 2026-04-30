@@ -3,7 +3,7 @@
  * Plugin Name: Searchly
  * Plugin URI: https://webkonsulenterne.dk
  * Description: Advanced search system with intelligent suggestions, filters, and analytics for WooCommerce stores
- * Version: 2.0.8
+ * Version: 2.0.9
  * Author: Imran Khan
  * License: GPL v2 or later
  * Text Domain: woo-fast-search
@@ -28,7 +28,7 @@ add_action('before_woocommerce_init', function() {
 });
 
 // Define plugin constants
-define('WK_SEARCH_SYSTEM_VERSION', '2.0.8');
+define('WK_SEARCH_SYSTEM_VERSION', '2.0.9');
 define('WK_SEARCH_SYSTEM_PLUGIN_FILE', __FILE__);
 define('WK_SEARCH_SYSTEM_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('WK_SEARCH_SYSTEM_PLUGIN_URL', plugin_dir_url(__FILE__));
@@ -1193,7 +1193,11 @@ function wkfs_render_elementor_loop_item_for_product( $product_id, $loop_item_te
 if (!function_exists('wk_fast_search_swap_request_uri')) {
 function wk_fast_search_swap_request_uri($product_id) {
     $original = array_key_exists('REQUEST_URI', $_SERVER) ? $_SERVER['REQUEST_URI'] : null;
-    $permalink = get_permalink($product_id);
+    // Prefer the WC product's own permalink — for variations this returns parent_url + ?attribute_*=…,
+    // which has the correct path component. The global get_permalink() can return an unhelpful URL
+    // for product_variation posts (rewrite=false). Falls back to the global if WC isn't loaded.
+    $product = function_exists('wc_get_product') ? wc_get_product($product_id) : null;
+    $permalink = $product ? $product->get_permalink() : get_permalink($product_id);
     if ($permalink) {
         $path = wp_parse_url($permalink, PHP_URL_PATH);
         if ($path) {
@@ -1253,7 +1257,11 @@ function wkfs_render_woo_product_card( $product_id ) {
     // Post-process: Fill empty title-wrapper and price-wrapper if present (for Flatsome theme)
     if (!empty($html) && (strpos($html, 'title-wrapper') !== false || strpos($html, 'price-wrapper') !== false)) {
         $title = $product->get_name();
-        $permalink = get_permalink($product->get_id());
+        // $product->get_permalink() — WC_Product_Variation overrides this to return parent_url + ?attribute_*=…,
+        // which is what makes the title link land on the right variant. The global get_permalink($id) doesn't
+        // know about variation attribute params (product_variation post type is registered with rewrite=false).
+        // For non-variations the two return the same string, so this is safe across the board.
+        $permalink = $product->get_permalink();
         $price_html = $product->get_price_html();
         
         // Inject title if wrapper is empty - match Flatsome's actual structure
@@ -1303,19 +1311,20 @@ function wk_fast_search_build_feed_item($product, $context_parent, $settings) {
         return null;
     }
 
-    // Pre-rendered HTML: render top-level products as before.
-    // Variations skip the pre-render — RenderController handles them on-demand at search time
-    // (variation post + content-product.php template can produce theme-specific oddities; on-demand
-    // rendering keeps the feed clean and gives the storefront fresh HTML each request).
+    // Pre-rendered HTML — same path for both top-level products and variations.
+    // For a variation, wc_get_product($variation_id) returns a WC_Product_Variation and the
+    // renderer's existing theme post-process (Flatsome's title-wrapper injection) already pulls
+    // $product->get_name() (variation name) and get_permalink($variation_id) (variation URL with
+    // ?attribute_*=…). REQUEST_URI is also swapped to the variation's path inside the renderer,
+    // so WC's add_to_cart_url() bakes in variation_id + attribute params correctly. No swaps
+    // needed here.
     $rendered_html = '';
-    if (!$is_variation) {
-        $render_mode = $settings['render_mode'];
-        $loop_id = (int) $settings['elementor_loop_id'];
-        if ($render_mode === 'elementor' && $loop_id > 0 && class_exists('Elementor\\Plugin')) {
-            $rendered_html = wkfs_render_elementor_loop_item_for_product($product->get_id(), $loop_id);
-        } else {
-            $rendered_html = wkfs_render_woo_product_card($product->get_id());
-        }
+    $render_mode = $settings['render_mode'];
+    $loop_id = (int) $settings['elementor_loop_id'];
+    if ($render_mode === 'elementor' && $loop_id > 0 && class_exists('Elementor\\Plugin')) {
+        $rendered_html = wkfs_render_elementor_loop_item_for_product($product->get_id(), $loop_id);
+    } else {
+        $rendered_html = wkfs_render_woo_product_card($product->get_id());
     }
 
     // Image: variations may have their own image; fall back to parent.
@@ -1353,8 +1362,11 @@ function wk_fast_search_build_feed_item($product, $context_parent, $settings) {
         'price' => $price,
         'price_old' => $price_old,
         'currency' => get_woocommerce_currency(),
-        // Per-variation stock — the existing hide_out_of_stock display filter then handles visibility.
-        'in_stock' => $product->is_in_stock(),
+        // Variation _stock_status meta is sometimes empty for parent-managed stock — WC then reports
+        // OOS even though the variation is purchasable. Trust WC, but for variations also accept
+        // parent's stock when the variation isn't explicitly tagged outofstock.
+        'in_stock' => $product->is_in_stock()
+            || ($is_variation && $context_parent && $product->get_stock_status() !== 'outofstock' && $context_parent->is_in_stock()),
         'rating' => $is_variation ? $context_parent->get_average_rating() : $product->get_average_rating(),
         'image' => $image_url,
         'html' => $rendered_html ? do_shortcode($rendered_html) : null,
