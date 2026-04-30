@@ -193,7 +193,8 @@ class WKSearchOverlay {
         this.createOverlay();
         this.showOverlay();
         this.focusSearchInput();
-        
+        // Note: setupInfiniteScroll() is invoked from setupOverlayEvents() (called by createOverlay).
+
         // Track overlay open
         this.trackEvent('search_overlay_opened');
 
@@ -212,10 +213,18 @@ class WKSearchOverlay {
             if (q.length >= minChars) { this.trackSearchOnce(q); }
         } catch(e){}
 
+        // Tear down the infinite-scroll observer (set up by setupInfiniteScroll on createOverlay);
+        // the overlay DOM is about to be removed, but disconnecting explicitly avoids any chance
+        // of a stale observer firing.
+        if (this._io) {
+            try { this._io.disconnect(); } catch (e) {}
+            this._io = null;
+        }
+
         this.isOverlayOpen = false;
         this.hideOverlay();
         this.selectedIndex = -1;
-        
+
         // Track overlay close
         this.trackEvent('search_overlay_closed');
     }
@@ -916,6 +925,17 @@ class WKSearchOverlay {
             }
         }
         
+        // Backspaced/cut all the way to empty: restore the popular-products view rather than leaving
+        // the previous search results sitting there (matches the behaviour of clicking the clear icon).
+        if (query.length === 0) {
+            this.hideNoResults();
+            if (!this.isDefaultView) {
+                this.loadDefaultProducts();
+            } else {
+                this.showSuggestions();
+            }
+            return;
+        }
         const minChars = (this.config && this.config.minChars) ? this.config.minChars : 3;
         if (query.length < minChars) {
             this.hideNoResults();
@@ -1666,16 +1686,10 @@ class WKSearchOverlay {
             });
         }
 
-        // Show/hide load more button
+        // Load More button removed — using infinite scroll (setupInfiniteScroll) for cleaner UX.
+        // The container element stays in the DOM (existing JS hooks reference it) but is never shown.
         const loadMore = document.getElementById('wk-search-load-more');
-        const loadMoreBtn = loadMore.querySelector('.wk-search-load-more-btn');
-        
-        if (this.hasMoreResults && this.results.length > 0) {
-            loadMore.style.display = 'block';
-            loadMoreBtn.textContent = ` ${this.config.strings.loadMore} (${this.results.length}/${this.totalResults})`;
-        } else {
-            loadMore.style.display = 'none';
-        }
+        if (loadMore) { loadMore.style.display = 'none'; }
     }
 
     createProductElement(product, index) {
@@ -2539,21 +2553,23 @@ class WKSearchOverlay {
         const searchInput = document.getElementById('wk-search-input');
         searchInput.value = '';
         this.currentQuery = '';
-        
+
         const clearBtn = document.querySelector('.wk-search-clear');
         clearBtn.style.display = 'none';
-        
+
         // Show original search icon when cleared
         if (this.originalSearchIcon) {
             this.originalSearchIcon.style.display = 'block';
         }
-        
+
         // Clear all filters when clearing search
         this.clearAllFilters();
-        
-        // Show bars again
-        try { this.renderRecentQueriesBar(); this.renderTopQueriesBar(); } catch(e){}
-        this.showSuggestions();
+
+        // Recent-queries bar isn't refreshed by loadDefaultProducts (which only renders the top-queries bar),
+        // so render it explicitly. loadDefaultProducts handles the top-queries bar, popular products fetch, and display.
+        try { this.renderRecentQueriesBar(); } catch(e){}
+        // Restore the empty-state popular-products view — replaces stale search results.
+        this.loadDefaultProducts();
     }
     
     clearAllFilters() {

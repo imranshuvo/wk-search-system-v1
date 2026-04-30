@@ -3,7 +3,7 @@
  * Plugin Name: Searchly
  * Plugin URI: https://webkonsulenterne.dk
  * Description: Advanced search system with intelligent suggestions, filters, and analytics for WooCommerce stores
- * Version: 2.0.6
+ * Version: 2.0.8
  * Author: Imran Khan
  * License: GPL v2 or later
  * Text Domain: woo-fast-search
@@ -28,7 +28,7 @@ add_action('before_woocommerce_init', function() {
 });
 
 // Define plugin constants
-define('WK_SEARCH_SYSTEM_VERSION', '2.0.6');
+define('WK_SEARCH_SYSTEM_VERSION', '2.0.8');
 define('WK_SEARCH_SYSTEM_PLUGIN_FILE', __FILE__);
 define('WK_SEARCH_SYSTEM_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('WK_SEARCH_SYSTEM_PLUGIN_URL', plugin_dir_url(__FILE__));
@@ -1178,19 +1178,52 @@ function wkfs_render_elementor_loop_item_for_product( $product_id, $loop_item_te
     return $html;
 }}
 
+/**
+ * Temporarily swap $_SERVER['REQUEST_URI'] to a product's permalink path.
+ *
+ * WooCommerce's WC_Product::add_to_cart_url() (and several template helpers) build URLs via
+ * add_query_arg() WITHOUT a base argument, which falls back to $_SERVER['REQUEST_URI']. When
+ * we render product cards from non-storefront contexts (wp-cron tick generating products.json,
+ * admin-post handler for the "Generate now" button, or admin-ajax for on-demand renders), that
+ * REQUEST_URI is something like /wp-cron.php or /wp-admin/admin-ajax.php — and the rendered HTML
+ * ends up containing add-to-cart URLs like "/wp-cron.php?add-to-cart=123" which 404 on click.
+ *
+ * Returns the original REQUEST_URI value (or null sentinel) so the caller can restore it.
+ */
+if (!function_exists('wk_fast_search_swap_request_uri')) {
+function wk_fast_search_swap_request_uri($product_id) {
+    $original = array_key_exists('REQUEST_URI', $_SERVER) ? $_SERVER['REQUEST_URI'] : null;
+    $permalink = get_permalink($product_id);
+    if ($permalink) {
+        $path = wp_parse_url($permalink, PHP_URL_PATH);
+        if ($path) {
+            $_SERVER['REQUEST_URI'] = $path;
+        }
+    }
+    return $original;
+}}
+if (!function_exists('wk_fast_search_restore_request_uri')) {
+function wk_fast_search_restore_request_uri($original) {
+    if ($original === null) {
+        unset($_SERVER['REQUEST_URI']);
+    } else {
+        $_SERVER['REQUEST_URI'] = $original;
+    }
+}}
+
 if (!function_exists('wkfs_render_woo_product_card')) {
 function wkfs_render_woo_product_card( $product_id ) {
     global $post, $product;
     $original_post = $post;
     $original_product = $product;
-    
+
     $post = get_post( $product_id );
     $product = wc_get_product( $product_id );
-    
-    if (!$post || !$product) { 
-        return ''; 
+
+    if (!$post || !$product) {
+        return '';
     }
-    
+
     // Force product visibility for rendering (includes 'search' visibility products)
     $force_visible = function($visible, $id) use ($product_id) {
         if ($id === $product_id) {
@@ -1199,15 +1232,21 @@ function wkfs_render_woo_product_card( $product_id ) {
         return $visible;
     };
     add_filter('woocommerce_product_is_visible', $force_visible, 10, 2);
-    
+
     setup_postdata( $post );
-    
+
+    // Make WC's add-to-cart URL (and any other add_query_arg calls in the template) resolve
+    // against the product's permalink instead of whatever the current request URI happens to be.
+    $original_request_uri = wk_fast_search_swap_request_uri($product_id);
+
     ob_start();
     wc_get_template_part('content', 'product');
     $html = ob_get_clean();
-    
+
+    wk_fast_search_restore_request_uri($original_request_uri);
+
     wp_reset_postdata();
-    
+
     // Remove filter
     remove_filter('woocommerce_product_is_visible', $force_visible, 10, 2);
     
